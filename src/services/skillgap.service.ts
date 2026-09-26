@@ -1,19 +1,35 @@
 // ============================================================
-// PlacementOS — Skill Gap Service
+// PlacementOS — Skill Gap Service (Supabase + Local Cache)
 // ============================================================
 
 import { supabase } from '../lib/supabase';
 import type {
   SkillGap,
-  StudentSkill,
-  JobSkill,
   ResumeAnalysis,
   JobAnalysis,
   ReadinessScore,
   ReadinessComponent,
   SkillCategory,
-  SKILL_CATEGORY_LABELS,
 } from '../types';
+
+const LOCAL_GAPS_KEY = 'placementos_skill_gaps';
+
+function getLocalGaps(userId: string): SkillGap[] {
+  try {
+    const raw = localStorage.getItem(`${LOCAL_GAPS_KEY}_${userId}`);
+    return raw ? JSON.parse(raw) : [];
+  } catch {
+    return [];
+  }
+}
+
+function saveLocalGaps(userId: string, gaps: SkillGap[]): void {
+  try {
+    localStorage.setItem(`${LOCAL_GAPS_KEY}_${userId}`, JSON.stringify(gaps));
+  } catch {
+    // ignore
+  }
+}
 
 export const skillGapService = {
   async generateGaps(
@@ -23,103 +39,154 @@ export const skillGapService = {
     jobAnalysis: JobAnalysis | null,
     assessmentScores: Map<string, number>
   ): Promise<SkillGap[]> {
-    if (!jobAnalysis) return [];
+    if (!jobAnalysis || !jobAnalysis.required_skills) return [];
 
-    // Clear existing gaps for this job
-    await supabase
-      .from('skill_gaps')
-      .delete()
-      .eq('user_id', userId)
-      .eq('job_id', jobId);
-
-    const gaps: Omit<SkillGap, 'id' | 'created_at' | 'updated_at' | 'skill'>[] = [];
+    const gaps: SkillGap[] = [];
 
     for (const reqSkill of jobAnalysis.required_skills) {
-      // Find student's level from resume claims
+      const skillName = reqSkill.name;
+      const category = reqSkill.category as SkillCategory;
+      const requiredLevel = reqSkill.level || 75;
+
       let currentLevel = 0;
+      let isVerified = false;
+      let isClaimed = false;
+
+      // 1. Check verified assessment scores
+      const assessScore = assessmentScores.get(category) ??
+                          assessmentScores.get(skillName.toLowerCase()) ??
+                          assessmentScores.get(category.replace('_', ' '));
+
+      if (assessScore !== undefined) {
+        currentLevel = assessScore;
+        isVerified = true;
+      }
+
+      // 2. Check resume claimed skills if no assessment or if resume claim is higher
       if (resumeAnalysis) {
-        const matchingSkill = resumeAnalysis.skills.find(
-          s => s.name.toLowerCase() === reqSkill.name.toLowerCase() ||
-               s.category === reqSkill.category
+        const lowerName = skillName.toLowerCase();
+        const matchingSkill = resumeAnalysis.skills?.find(
+          s => s.name.toLowerCase().includes(lowerName) ||
+               lowerName.includes(s.name.toLowerCase()) ||
+               s.category === category
         );
-        if (matchingSkill) {
-          currentLevel = matchingSkill.proficiency === 'advanced' ? 80 :
-                         matchingSkill.proficiency === 'intermediate' ? 55 : 30;
+
+        const inLangs = resumeAnalysis.programming_languages?.some(l => lowerName.includes(l.toLowerCase()));
+        const inFrameworks = resumeAnalysis.frameworks?.some(f => lowerName.includes(f.toLowerCase()));
+        const inTools = resumeAnalysis.tools?.some(t => lowerName.includes(t.toLowerCase()));
+
+        if (matchingSkill || inLangs || inFrameworks || inTools) {
+          isClaimed = true;
+          if (!isVerified) {
+            const prof = matchingSkill?.proficiency || 'intermediate';
+            currentLevel = prof === 'advanced' ? 75 : prof === 'intermediate' ? 55 : 35;
+          }
         }
       }
 
-      // Override with assessment scores if available
-      const assessmentScore = assessmentScores.get(reqSkill.category) ??
-                              assessmentScores.get(reqSkill.name.toLowerCase());
-      if (assessmentScore !== undefined) {
-        currentLevel = assessmentScore;
-      }
-
-      const gapScore = Math.max(0, reqSkill.level - currentLevel);
+      const gapScore = Math.max(0, requiredLevel - currentLevel);
       let priority: SkillGap['priority'] = 'low';
-      if (gapScore >= 40) priority = 'critical';
-      else if (gapScore >= 25) priority = 'high';
+      if (gapScore >= 35) priority = 'critical';
+      else if (gapScore >= 20) priority = 'high';
       else if (gapScore >= 10) priority = 'medium';
 
-      if (gapScore > 0) {
-        gaps.push({
-          user_id: userId,
-          job_id: jobId,
-          skill_id: reqSkill.name, // Using name as fallback for skill_id
-          current_level: currentLevel,
-          required_level: reqSkill.level,
-          gap_score: gapScore,
-          priority,
-          reason: currentLevel === 0
-            ? `No evidence of ${reqSkill.name} skills found. This is a ${reqSkill.importance} skill for the target role.`
-            : assessmentScore !== undefined
-            ? `Assessment score (${assessmentScore}%) is below the required level (${reqSkill.level}%). Focus on improving through targeted practice.`
-            : `Resume claims ${reqSkill.name} but it has not been verified through assessment. Current estimated level is ${currentLevel}%.`,
-          recommended_action: gapScore >= 40
-            ? `Start with ${reqSkill.name} fundamentals and build up systematically. Allocate at least 1 hour daily.`
-            : gapScore >= 25
-            ? `Focus on intermediate ${reqSkill.name} concepts and practice problems regularly.`
-            : `Review advanced ${reqSkill.name} topics and attempt harder problems.`,
-        });
+      let reason = '';
+      let recommendedAction = '';
+
+      if (isVerified) {
+        if (gapScore > 0) {
+          reason = `Diagnostic score (${currentLevel}%) is below target threshold (${requiredLevel}%). Core concept edge-cases and optimization speed need reinforcement.`;
+          recommendedAction = `Review advanced ${skillName} patterns, solve 5-10 targeted medium-difficulty problems, and retake the diagnostic assessment.`;
+        } else {
+          reason = `Skill verified at ${currentLevel}% (Exceeds required ${requiredLevel}%). Excellent foundation.`;
+          recommendedAction = `Maintain readiness with weekly spaced-repetition refreshers.`;
+        }
+      } else if (isClaimed) {
+        reason = `Claimed on resume (Estimated ~${currentLevel}%), but unverified by diagnostic tests. Interviewers rigorously probe claimed skills.`;
+        recommendedAction = `Take the 5-minute ${skillName} verification assessment to validate your proficiency and boost your Placement Twin score.`;
+      } else {
+        reason = `No evidence found on resume or assessments. Required at ${requiredLevel}% for ${jobAnalysis.role || 'the target role'}.`;
+        recommendedAction = `Start foundational study for ${skillName}. Focus on fundamental definitions, core implementations, and practical interview questions.`;
       }
+
+      gaps.push({
+        id: `gap_${jobId}_${category}_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`,
+        user_id: userId,
+        job_id: jobId,
+        skill_id: skillName,
+        current_level: currentLevel,
+        required_level: requiredLevel,
+        gap_score: gapScore,
+        priority,
+        reason,
+        recommended_action: recommendedAction,
+        created_at: new Date().toISOString(),
+        updated_at: new Date().toISOString(),
+      });
     }
 
-    if (gaps.length > 0) {
-      const { data, error } = await supabase
-        .from('skill_gaps')
-        .insert(gaps)
-        .select();
+    // Sort by priority and gap score descending
+    const priorityWeight = { critical: 4, high: 3, medium: 2, low: 1 };
+    gaps.sort((a, b) => {
+      const pDiff = (priorityWeight[b.priority] || 0) - (priorityWeight[a.priority] || 0);
+      return pDiff !== 0 ? pDiff : b.gap_score - a.gap_score;
+    });
 
-      if (error) {
-        console.error('Error saving skill gaps:', error);
-        // Return unsaved gaps with placeholder IDs for display
-        return gaps.map((g, i) => ({
-          ...g,
-          id: `temp-${i}`,
-          created_at: new Date().toISOString(),
-          updated_at: new Date().toISOString(),
-        })) as SkillGap[];
+    saveLocalGaps(userId, gaps);
+
+    // Try saving to Supabase if table exists
+    try {
+      if (supabase) {
+        await supabase.from('skill_gaps').delete().eq('user_id', userId).eq('job_id', jobId);
+        await supabase.from('skill_gaps').insert(
+          gaps.map(g => ({
+            user_id: userId,
+            job_id: jobId,
+            skill_id: g.skill_id,
+            current_level: g.current_level,
+            required_level: g.required_level,
+            gap_score: g.gap_score,
+            priority: g.priority,
+            reason: g.reason,
+            recommended_action: g.recommended_action,
+          }))
+        );
       }
-      return data || [];
+    } catch {
+      // ignore
     }
 
-    return [];
+    return gaps;
   },
 
   async getGaps(userId: string, jobId?: string): Promise<SkillGap[]> {
-    let query = supabase
-      .from('skill_gaps')
-      .select('*')
-      .eq('user_id', userId)
-      .order('gap_score', { ascending: false });
+    try {
+      if (supabase) {
+        let query = supabase
+          .from('skill_gaps')
+          .select('*')
+          .eq('user_id', userId)
+          .order('gap_score', { ascending: false });
 
-    if (jobId) {
-      query = query.eq('job_id', jobId);
+        if (jobId) {
+          query = query.eq('job_id', jobId);
+        }
+
+        const { data, error } = await query;
+        if (!error && data && data.length > 0) {
+          saveLocalGaps(userId, data as SkillGap[]);
+          return data as SkillGap[];
+        }
+      }
+    } catch {
+      // ignore
     }
 
-    const { data, error } = await query;
-    if (error) throw error;
-    return data || [];
+    const local = getLocalGaps(userId);
+    if (jobId) {
+      return local.filter(g => g.job_id === jobId);
+    }
+    return local;
   },
 
   calculateReadiness(
@@ -128,19 +195,18 @@ export const skillGapService = {
     resumeAnalysis: ResumeAnalysis | null
   ): ReadinessScore {
     const weights: Record<string, { weight: number; label: string; categories: string[] }> = {
-      dsa: { weight: 0.20, label: 'DSA', categories: ['dsa', 'algorithms'] },
-      cs_fundamentals: { weight: 0.20, label: 'CS Fundamentals', categories: ['dbms', 'operating_systems', 'computer_networks'] },
-      programming: { weight: 0.15, label: 'Programming', categories: ['programming', 'oop'] },
-      projects: { weight: 0.15, label: 'Projects', categories: ['web_development', 'project_knowledge'] },
-      communication: { weight: 0.10, label: 'Communication', categories: ['communication'] },
-      aptitude: { weight: 0.10, label: 'Aptitude', categories: ['aptitude', 'problem_solving'] },
-      interview_skills: { weight: 0.10, label: 'Interview Skills', categories: ['interview_skills'] },
+      dsa: { weight: 0.25, label: 'Data Structures & Algorithms', categories: ['dsa', 'algorithms'] },
+      cs_fundamentals: { weight: 0.20, label: 'CS Fundamentals (OS, DBMS, Networks)', categories: ['dbms', 'operating_systems', 'computer_networks'] },
+      programming: { weight: 0.15, label: 'Core Programming & OOP', categories: ['programming', 'oop'] },
+      projects: { weight: 0.15, label: 'System Design & Projects', categories: ['web_development', 'system_design', 'project_knowledge'] },
+      aptitude: { weight: 0.15, label: 'Quantitative & Logical Aptitude', categories: ['aptitude', 'problem_solving'] },
+      communication: { weight: 0.10, label: 'Communication & STAR Interviewing', categories: ['communication', 'interview_skills'] },
     };
 
     const components: ReadinessComponent[] = [];
 
     for (const [key, config] of Object.entries(weights)) {
-      let score = 30; // Base score
+      let score = 35; // Base score
 
       // Check assessment scores
       for (const cat of config.categories) {
@@ -150,17 +216,17 @@ export const skillGapService = {
         }
       }
 
-      // Boost from resume claims (but less than assessment)
+      // Boost from resume claims
       if (resumeAnalysis) {
-        const hasResumeEvidence = resumeAnalysis.skills.some(
-          s => config.categories.includes(s.category)
+        const hasResumeEvidence = resumeAnalysis.skills?.some(s =>
+          config.categories.includes(s.category)
         );
-        if (hasResumeEvidence && score < 50) {
-          score = Math.max(score, 45); // Resume claim gives base 45
+        if (hasResumeEvidence && score < 55) {
+          score = Math.max(score, 50);
         }
       }
 
-      // Reduce for gaps
+      // Penalize for gaps
       const relatedGaps = gaps.filter(g => {
         const gapCat = g.skill_id?.toLowerCase() || '';
         return config.categories.some(c => gapCat.includes(c)) ||
@@ -169,7 +235,7 @@ export const skillGapService = {
 
       if (relatedGaps.length > 0) {
         const avgGap = relatedGaps.reduce((sum, g) => sum + g.gap_score, 0) / relatedGaps.length;
-        score = Math.max(10, score - avgGap * 0.5);
+        score = Math.max(15, score - avgGap * 0.4);
       }
 
       score = Math.round(Math.min(100, Math.max(0, score)));
@@ -192,22 +258,22 @@ export const skillGapService = {
     const weak = components.filter(c => c.score < 50).map(c => c.label);
 
     if (strong.length > 0) {
-      explanationParts.push(`Strong in: ${strong.join(', ')}.`);
+      explanationParts.push(`Strengths: ${strong.join(', ')}.`);
     }
     if (weak.length > 0) {
-      explanationParts.push(`Needs improvement: ${weak.join(', ')}.`);
+      explanationParts.push(`Priority focus: ${weak.join(', ')}.`);
     }
     if (gaps.length > 0) {
       const criticalGaps = gaps.filter(g => g.priority === 'critical');
       if (criticalGaps.length > 0) {
-        explanationParts.push(`${criticalGaps.length} critical skill gap(s) detected.`);
+        explanationParts.push(`${criticalGaps.length} critical requirement gap(s) must be closed before drive.`);
       }
     }
 
     return {
       overall: Math.min(100, Math.max(0, overall)),
       components,
-      explanation: explanationParts.join(' ') || 'Upload your resume and take assessments to get a detailed readiness analysis.',
+      explanation: explanationParts.join(' ') || 'Upload your resume and complete assessments to calibrate your Placement Twin.',
       last_updated: new Date().toISOString(),
     };
   },

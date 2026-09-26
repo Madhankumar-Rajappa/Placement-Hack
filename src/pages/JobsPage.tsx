@@ -12,7 +12,7 @@ import {
   Briefcase, Plus, Trash2, Brain, Star, StarOff,
   Building2, Code, CheckCircle2, X,
 } from 'lucide-react';
-import { jobService } from '../services/job.service';
+import { jobService, PRESET_TARGET_JOBS } from '../services/job.service';
 import type { Job, JobAnalysis } from '../types';
 
 export default function JobsPage() {
@@ -63,12 +63,42 @@ export default function JobsPage() {
         source_type: 'paste',
       });
       setJobs(prev => [job, ...prev]);
+      setSelectedJob(job);
       setForm({ role: '', company: '', description: '' });
       setShowForm(false);
+
+      // Automatically run AI analysis
+      setAnalyzingId(job.id);
+      try {
+        const analysis = await jobService.analyze(job.id, job.description);
+        setJobs(prev =>
+          prev.map(j =>
+            j.id === job.id
+              ? { ...j, analysis_status: 'completed', analysis_json: analysis, role: analysis.role || j.role, company: analysis.company || j.company }
+              : j
+          )
+        );
+        setSelectedJob(prev => prev ? { ...prev, analysis_status: 'completed', analysis_json: analysis } : null);
+      } catch (analysisErr) {
+        console.warn('Auto-analyze job error:', analysisErr);
+      } finally {
+        setAnalyzingId(null);
+      }
     } catch (err: any) {
       setError(err.message || 'Failed to add job');
     } finally {
       setAdding(false);
+    }
+  };
+
+  const handleLoadSampleJob = (index: number) => {
+    const preset = PRESET_TARGET_JOBS[index];
+    if (preset) {
+      setForm({
+        role: preset.role,
+        company: preset.company,
+        description: preset.description,
+      });
     }
   };
 
@@ -140,6 +170,18 @@ export default function JobsPage() {
       {showForm && (
         <Card className="mb-6 animate-scale-in">
           <CardHeader title="Add Job Description" icon={Plus} />
+          <div className="flex items-center gap-2 mb-4 pb-3 border-b border-border">
+            <span className="text-xs text-text-muted font-medium">Quick Load Role Preset:</span>
+            <button type="button" onClick={() => handleLoadSampleJob(0)} className="btn btn-xs btn-secondary">
+              SDE-1
+            </button>
+            <button type="button" onClick={() => handleLoadSampleJob(1)} className="btn btn-xs btn-secondary">
+              Full Stack
+            </button>
+            <button type="button" onClick={() => handleLoadSampleJob(2)} className="btn btn-xs btn-secondary">
+              AI / ML
+            </button>
+          </div>
           <form onSubmit={handleAdd} className="space-y-4">
             <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
               <div>
